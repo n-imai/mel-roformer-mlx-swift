@@ -62,13 +62,23 @@ let rms = (sumSq / Float(2 * n)).squareRoot()
 let hasInf = maxAbs.isInfinite
 
 let audioSec = Double(n) / 44100.0
+
+// Non-finite metrics (NaN/Inf — exactly the failure this harness exists to catch) are
+// not valid JSON, so JSONSerialization would throw and a swallowed `try?` would emit
+// NOTHING. Encode them as string tokens so the JSON stays valid, and ALSO print the
+// critical flags on a plain line that never depends on serialization.
+func jsonSafe(_ x: Float) -> Any { x.isFinite ? Double(x) : "\(x)" }   // -> "nan"/"inf"/"-inf"
+
+FileHandle.standardError.write(Data(
+    "STATS nan=\(hasNaN) inf=\(hasInf) peak=\(maxAbs) rms=\(rms) n=\(n)\n".utf8))
+
 let report: [String: Any] = [
     "body_dt": (bodyDType == .float16 ? "float16" : "float32"),
     "n_samples": n,
     "nan": hasNaN,
     "inf": hasInf,
-    "peak": maxAbs,
-    "rms": rms,
+    "peak": jsonSafe(maxAbs),
+    "rms": jsonSafe(rms),
     "audio_sec": (audioSec * 100).rounded() / 100,
     "compute_sec": (computeSec * 100).rounded() / 100,
     "rtf_total": computeSec > 0 ? ((audioSec / computeSec * 1000).rounded() / 1000) : 0,
@@ -76,6 +86,8 @@ let report: [String: Any] = [
 if let json = try? JSONSerialization.data(withJSONObject: report),
    let s = String(data: json, encoding: .utf8) {
     print(s)
+} else {
+    print("{\"nan\":\(hasNaN),\"inf\":\(hasInf),\"n_samples\":\(n)}")
 }
 
 try MLX.save(arrays: ["audio": out.asType(.float32)], url: outURL)
