@@ -40,6 +40,15 @@ let package = Package(
             ],
             path: "Sources/RoFormerValidate"
         ),
+        .executableTarget(
+            name: "roformer-dump",
+            dependencies: [
+                "SwiftRoFormer",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Sources/RoFormerDump"
+        ),
         .testTarget(
             name: "SwiftRoFormerTests",
             dependencies: [
