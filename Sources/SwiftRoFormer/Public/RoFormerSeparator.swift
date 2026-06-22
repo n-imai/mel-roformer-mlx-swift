@@ -78,8 +78,10 @@ public protocol RoFormerProgressDelegate: AnyObject {
 /// Kim Mel-RoFormer vocal separator.
 ///
 /// Separates vocals from music using the Kim Vocal 2 Mel-RoFormer model
-/// (228M parameters, ~12.6 dB SDR). Processes audio in 8-second chunks
-/// with 50% overlap for seamless results.
+/// (228M parameters, ~12.6 dB SDR). Processes audio in 11-second chunks with an
+/// 8-second hop (3s overlap), end-anchored final chunks, and a symmetric-Hamming
+/// overlap-add normalized by divide-by-counter — the verified audio-separator demix
+/// recipe (see ``OverlapAdd``).
 ///
 /// Three API styles are available:
 ///
@@ -352,16 +354,21 @@ public final class RoFormerSeparator: @unchecked Sendable {
 
     /// Separate vocals from raw audio samples (in-memory).
     ///
-    /// - Parameter samples: Stereo audio `[1, 2, samples]` at 44.1kHz.
+    /// - Parameters:
+    ///   - samples: Stereo audio `[1, 2, samples]` at 44.1kHz.
+    ///   - bodyDType: Transformer-body precision. `.float32` (default) or `.float16`
+    ///     for the on-device shipping path (requires fp16 weights loaded and the
+    ///     RMSNorm fp32-reduction patch). STFT/iSTFT always run in fp32.
     /// - Returns: Separated vocals `[1, 2, samples]`.
     /// - Throws: `RoFormerError` on failure or cancellation.
-    public func separate(samples: MLXArray) async throws -> MLXArray {
+    public func separate(samples: MLXArray, bodyDType: DType = .float32) async throws -> MLXArray {
         cancelFlag.withLock { $0 = false }
         let startTime = CFAbsoluteTimeGetCurrent()
         return try await separateChunked(
             samples,
             sampleCount: samples.shape[2],
             startTime: startTime,
+            bodyDType: bodyDType,
             progressHandler: nil
         )
     }
@@ -382,144 +389,72 @@ public final class RoFormerSeparator: @unchecked Sendable {
         _ audio: MLXArray,
         sampleCount: Int,
         startTime: CFAbsoluteTime,
+        bodyDType: DType = .float32,
         progressHandler: ((Float, RoFormerStage) -> Void)?
     ) async throws -> MLXArray {
-        let chunkSamples = config.chunkSize  // 352800 (8s at 44.1kHz)
-        let stepSize = chunkSamples / config.numOverlap  // 176400 (50% overlap)
+        let chunkSize = config.chunkSize   // 485100 (~11s)
+        let step = config.chunkStep        // 352800 (~8s) → 3s overlap
 
-        // Single chunk fast path
-        if sampleCount <= chunkSamples {
+        // Single-chunk fast path: the whole clip fits in one chunk. Run the model
+        // directly (length-preserving) — no windowing/OLA needed. This also avoids the
+        // negative write-start the reference would compute for sampleCount < chunkSize.
+        if sampleCount <= chunkSize {
             progressHandler?(0.10, .stft)
-            let result = model(audio)
+            let result = model.forward(audio, bodyDType: bodyDType, capture: nil)
             MLX.eval(result)
             progressHandler?(0.90, .reconstruct)
             return result
         }
 
-        // Multi-chunk overlap-add
-        let totalChunks = (sampleCount - chunkSamples) / stepSize + 1
-        let outputLength = sampleCount
+        // Multi-chunk overlap-add, faithful to the Python reference (step3_chunk.py):
+        // per-sample symmetric-Hamming weights accumulate on CPU float32 buffers in the
+        // same chunk order, then divide-by-counter. The window cancels exactly where a
+        // sample is covered once and blends smoothly across the 3s overlap regions —
+        // no amplitude modulation, no boundary click. CPU float32 mirrors numpy and
+        // keeps result/counter as plain buffers (the future disk-streaming surface).
+        let window = OverlapAdd.hammingWindow(chunkSize)
+        let plan = OverlapAdd.chunkPlan(sampleCount: sampleCount, chunkSize: chunkSize, step: step)
 
-        // Initialize accumulation buffers
-        var output = MLXArray.zeros([1, 2, outputLength])
-        var totalWeight = MLXArray.zeros([1, 1, outputLength])
+        var resultL = [Float](repeating: 0, count: sampleCount)
+        var resultR = [Float](repeating: 0, count: sampleCount)
+        var counter = [Float](repeating: 0, count: sampleCount)
 
-        for chunkIdx in 0..<totalChunks {
+        for (chunkIdx, placement) in plan.enumerated() {
             try checkCancelled()
 
-            let offset = chunkIdx * stepSize
-            let end = min(offset + chunkSamples, sampleCount)
-            let actualLength = end - offset
-
-            // Extract chunk, pad if needed
-            var chunk = audio[0..., 0..., offset..<end]
-            if actualLength < chunkSamples {
-                let padSize = chunkSamples - actualLength
-                let padding = MLXArray.zeros([1, 2, padSize])
-                chunk = concatenated([chunk, padding], axis: 2)
-            }
-
-            // Report progress
-            let chunkFraction = Float(chunkIdx) / Float(totalChunks)
-            let overallFraction = 0.10 + chunkFraction * 0.80
-            progressHandler?(overallFraction, .transformer)
-
-            // Run model on chunk
-            let separated = model(chunk)
+            let chunk = audio[0..., 0..., placement.readStart ..< (placement.readStart + chunkSize)]
+            let separated = model.forward(chunk, bodyDType: bodyDType, capture: nil)
             MLX.eval(separated)
 
-            // Trim if padded
-            let trimmed = actualLength < chunkSamples
-                ? separated[0..., 0..., ..<actualLength]
-                : separated
+            let sep = separated[0]  // [2, chunkSize]
+            let outL = sep[0].asType(.float32).asArray(Float.self)
+            let outR = sep[1].asType(.float32).asArray(Float.self)
+            let safe = min(placement.length, outL.count, window.count)
+            let w = placement.writeStart
 
-            // Build crossfade weight window [1, 1, actualLength]
-            let weight = buildCrossfadeWeight(
-                chunkLength: actualLength,
-                overlapLength: chunkSamples - stepSize,
-                isFirst: chunkIdx == 0,
-                isLast: chunkIdx == totalChunks - 1
-            )
-
-            // Accumulate: weighted overlap-add
-            // We need to add weighted contribution at [offset:end]
-            let weighted = trimmed * weight
-
-            // Accumulate using slice assignment simulation
-            // Since MLX doesn't support slice assignment, we use padding + addition
-            let leftPad = offset
-            let rightPad = outputLength - end
-
-            if leftPad > 0 || rightPad > 0 {
-                var weightedParts = [MLXArray]()
-                var weightParts = [MLXArray]()
-
-                if leftPad > 0 {
-                    weightedParts.append(MLXArray.zeros([1, 2, leftPad]))
-                    weightParts.append(MLXArray.zeros([1, 1, leftPad]))
-                }
-                weightedParts.append(weighted)
-                weightParts.append(weight)
-                if rightPad > 0 {
-                    weightedParts.append(MLXArray.zeros([1, 2, rightPad]))
-                    weightParts.append(MLXArray.zeros([1, 1, rightPad]))
-                }
-
-                output = output + concatenated(weightedParts, axis: 2)
-                totalWeight = totalWeight + concatenated(weightParts, axis: 2)
-            } else {
-                output = output + weighted
-                totalWeight = totalWeight + weight
+            for k in 0..<safe {
+                let win = window[k]
+                resultL[w + k] += outL[k] * win
+                resultR[w + k] += outR[k] * win
+                counter[w + k] += win
             }
+
+            let frac = 0.10 + (Float(chunkIdx + 1) / Float(plan.count)) * 0.80
+            progressHandler?(frac, .transformer)
         }
 
-        // Normalize by total weight
-        let epsilon = MLXArray(Float(1e-8))
-        let normalizer = maximum(totalWeight, epsilon)
-        let result = output / normalizer
-        MLX.eval(result)
+        // Normalize by accumulated window weight (np.clip(counter, 1e-10, None)).
+        for n in 0..<sampleCount {
+            let c = max(counter[n], Float(1e-10))
+            resultL[n] /= c
+            resultR[n] /= c
+        }
 
+        let out = stacked([MLXArray(resultL), MLXArray(resultR)], axis: 0)
+            .expandedDimensions(axis: 0)  // [1, 2, sampleCount]
+        MLX.eval(out)
         progressHandler?(0.90, .reconstruct)
-        return result
-    }
-
-    /// Build a linear crossfade weight window for overlap-add.
-    ///
-    /// - Parameters:
-    ///   - chunkLength: Length of this chunk in samples.
-    ///   - overlapLength: Number of overlap samples between chunks.
-    ///   - isFirst: Whether this is the first chunk.
-    ///   - isLast: Whether this is the last chunk.
-    /// - Returns: Weight array `[1, 1, chunkLength]`.
-    private func buildCrossfadeWeight(
-        chunkLength: Int,
-        overlapLength: Int,
-        isFirst: Bool,
-        isLast: Bool
-    ) -> MLXArray {
-        // Start with all ones
-        var weights = [Float](repeating: 1.0, count: chunkLength)
-
-        // Apply fade-in at start (except for the first chunk)
-        // Use (overlapLength - 1) as divisor to get full range [0, 1]
-        if !isFirst && overlapLength > 1 {
-            let divisor = Float(overlapLength - 1)
-            for i in 0..<min(overlapLength, chunkLength) {
-                weights[i] = Float(i) / divisor
-            }
-        }
-
-        // Apply fade-out at end (except for the last chunk)
-        // Use (overlapLength - 1) as divisor to get full range [0, 1]
-        if !isLast && overlapLength > 1 {
-            let divisor = Float(overlapLength - 1)
-            for i in 0..<min(overlapLength, chunkLength) {
-                let idx = chunkLength - 1 - i
-                weights[idx] = Float(i) / divisor
-            }
-        }
-
-        return MLXArray(weights).reshaped([1, 1, chunkLength])
+        return out
     }
 
     // MARK: - Private: Helpers

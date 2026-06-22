@@ -70,11 +70,23 @@ public struct RoFormerConfiguration: Sendable {
     /// GPU memory cache limit in bytes.
     public var gpuCacheLimit: Int = 512 * 1024 * 1024  // 512 MB
 
-    /// Chunk size in samples for chunked processing (8 seconds at 44.1kHz).
-    public var chunkSize: Int = 352_800
+    /// Overlap-add chunk size in samples (~11.0s at 44.1kHz for kim_vocal_2).
+    ///
+    /// The base default is the VERIFIED kim_vocal_2 demix recipe value, reproducing the
+    /// audio-separator Roformer chunking that produced the approved separation quality:
+    /// `chunkSize = stft_hop(441) × (dim_t(1101) - 1) = 485100`. It is **preset-specific**
+    /// (NOT a universal constant): a preset with a different `hopLength` MUST override it,
+    /// or `separateChunked` would apply a chunk geometry that doesn't match the model's
+    /// STFT framing. See `zfturboVocalsV1`.
+    public var chunkSize: Int = 485_100
 
-    /// Number of overlap regions (2 = 50% overlap).
-    public var numOverlap: Int = 2
+    /// Overlap-add hop between consecutive chunks in samples (~8.0s at 44.1kHz).
+    ///
+    /// `chunkStep = min(overlap(8) × sampleRate, chunkSize) = 352800`, giving a 3.0s
+    /// overlap region per the verified recipe. Final chunks are end-anchored and the
+    /// per-sample Hamming weights are removed by divide-by-counter (see
+    /// ``OverlapAdd``). Like `chunkSize`, preset-specific.
+    public var chunkStep: Int = 352_800
 
     // MARK: - Presets
 
@@ -101,6 +113,13 @@ public struct RoFormerConfiguration: Sendable {
         config.depth = 8
         config.hopLength = 512
         config.maskEstimatorDepth = 1
+        // Override the chunk geometry so it tracks THIS preset's hop instead of silently
+        // inheriting kim_vocal_2's 485100 (which assumes hop=441). Kept consistent with
+        // the audio-separator default segment (dim_t=1101): chunkSize = 512 × (1101−1).
+        // ⚠️ UNVALIDATED — no Mac numerical verification exists for this checkpoint's
+        // chunking (Step 2 validated kim_vocal_2 only). Provided for internal consistency.
+        config.chunkSize = 563_200                              // 512 × (1101 − 1)
+        config.chunkStep = min(8 * 44_100, config.chunkSize)    // 352800
         return config
     }()
 
