@@ -40,11 +40,17 @@ class RoFormerRMSNorm: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // L2 normalize with F.normalize eps semantic: x / max(||x||₂, eps)
-        let squaredSum = sum(x * x, axis: -1, keepDims: true)
+        // fp32-reduction patch: compute the L2 norm (sum of squares) in fp32 even
+        // when x is fp16. The unnormalized sum(x²) reaches ~1.5e5 on some bands,
+        // which overflows fp16 (max 65504) → inf/NaN. This is the ONLY unbounded
+        // fp16 reduction in the model. Identical to fp32 when x is already fp32
+        // (the casts are no-ops). Mirrors mlx-audio's patched RMSNorm.
+        let xf = x.asType(.float32)
+        let squaredSum = sum(xf * xf, axis: -1, keepDims: true)
         let norm = sqrt(squaredSum)
-        let normalized = x / maximum(norm, MLXArray(Self.eps))
+        let normalized = xf / maximum(norm, MLXArray(Self.eps))
         // Scale by sqrt(dim) and learnable gamma
-        return normalized * scale * gamma
+        let out = normalized * scale * gamma.asType(.float32)
+        return out.asType(x.dtype)
     }
 }
