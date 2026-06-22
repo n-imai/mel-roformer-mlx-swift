@@ -80,6 +80,12 @@ enum STFT {
     private static func reflectPadded(_ x: MLXArray, pad: Int) -> MLXArray {
         if pad == 0 { return x }
         let samples = x.shape[1]
+        // Reflect padding mathematically requires more samples than the pad width
+        // (the reflected region mirrors x[1...pad] / x[samples-pad-1...samples-2]).
+        // torch.stft(pad_mode="reflect") and mlx-audio's dsp.stft both reject
+        // inputs shorter than this; fail loudly here rather than slicing out of range.
+        precondition(samples > pad,
+            "Input too short for reflect padding: need samples (\(samples)) > nFFT/2 (\(pad)).")
         let revIdx = MLXArray((0..<pad).reversed().map { Int32($0) })
         let left = x[0..., 1 ..< (pad + 1)].take(revIdx, axis: 1)
         let right = x[0..., (samples - pad - 1) ..< (samples - 1)].take(revIdx, axis: 1)

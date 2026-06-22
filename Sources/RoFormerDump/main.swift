@@ -23,6 +23,9 @@ let inputURL = URL(fileURLWithPath: CommandLine.arguments[2])
 let outURL = URL(fileURLWithPath: CommandLine.arguments[3])
 let bodyDType: DType = (CommandLine.arguments.count == 5 && CommandLine.arguments[4] == "fp16") ? .float16 : .float32
 
+// This validation harness targets the kim_vocal_2 architecture only (the VoicyCare
+// PoC checkpoint). Other presets (e.g. zfturbo_vocals_v1) have different dims and are
+// out of scope; WeightLoader rejects a mismatched checkpoint with a strict-load error.
 let model = MelRoFormer()
 try WeightLoader.loadWeights(into: model, from: weightsURL)
 
