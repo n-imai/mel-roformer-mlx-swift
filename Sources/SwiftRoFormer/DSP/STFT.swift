@@ -36,9 +36,12 @@ enum STFT {
         // Reshape to [batch * channels, samples] for frame extraction
         let flat = signal.reshaped([batch * channels, samples])
 
-        // Pad signal: center padding with nFFT/2 on each side
+        // Pad signal: center reflect padding with nFFT/2 on each side.
+        // Matches torch.stft(center=True, pad_mode="reflect") and mlx-audio
+        // dsp.stft — zero padding here corrupts the edge frames and (via time
+        // attention) contaminates the whole spectrogram. See Step 0 fidelity.
         let padAmount = nFFT / 2
-        let padded = padded(flat, left: padAmount, right: padAmount)
+        let padded = reflectPadded(flat, pad: padAmount)
 
         let paddedLength = padded.shape[1]
 
@@ -70,15 +73,16 @@ enum STFT {
         return result.transposed(0, 1, 3, 2)  // [batch, channels, freq_bins, frames]
     }
 
-    /// Zero-pad a 2D array on the last axis.
-    private static func padded(_ x: MLXArray, left: Int, right: Int) -> MLXArray {
-        let shape = x.shape
-        let batch = shape[0]
-        if left > 0 {
-            let leftPad = MLXArray.zeros([batch, left], dtype: x.dtype)
-            let rightPad = MLXArray.zeros([batch, right], dtype: x.dtype)
-            return concatenated([leftPad, x, rightPad], axis: 1)
-        }
-        return x
+    /// Reflect-pad a 2D array `[rows, samples]` on the last axis with torch /
+    /// mlx-audio "reflect" semantics (boundary sample excluded):
+    ///   left  = reverse(x[:, 1 : pad+1])
+    ///   right = reverse(x[:, samples-pad-1 : samples-1])
+    private static func reflectPadded(_ x: MLXArray, pad: Int) -> MLXArray {
+        if pad == 0 { return x }
+        let samples = x.shape[1]
+        let revIdx = MLXArray((0..<pad).reversed().map { Int32($0) })
+        let left = x[0..., 1 ..< (pad + 1)].take(revIdx, axis: 1)
+        let right = x[0..., (samples - pad - 1) ..< (samples - 1)].take(revIdx, axis: 1)
+        return concatenated([left, x, right], axis: 1)
     }
 }
