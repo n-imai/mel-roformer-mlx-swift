@@ -64,6 +64,20 @@ public class MelRoFormer: Module {
     /// - Parameter audio: Input audio `[batch, 2, samples]` (stereo, 44.1kHz).
     /// - Returns: Separated vocal audio `[batch, 2, samples]`.
     public func callAsFunction(_ audio: MLXArray) -> MLXArray {
+        forward(audio, bodyDType: .float32, capture: nil)
+    }
+
+    /// Same forward as `callAsFunction`, with:
+    /// - `bodyDType`: precision of the transformer body. STFT/iSTFT always run in
+    ///   fp32 (complex path); after STFT the CaC representation is cast to
+    ///   `bodyDType` and the masked result is cast back to fp32 before iSTFT.
+    ///   Pass `.float16` for the on-device shipping path (requires fp16 weights
+    ///   loaded and the RMSNorm fp32-reduction patch). Mirrors mlx-audio step2.
+    /// - `capture`: optional hook receiving each intermediate stage (name, tensor).
+    ///   Production passes `nil` (no-op); the dump path passes a closure. Single
+    ///   source of truth — no separate "debug forward" to drift.
+    public func forward(_ audio: MLXArray, bodyDType: DType = .float32,
+                        capture: ((String, MLXArray) -> Void)?) -> MLXArray {
         let originalLength = audio.shape[2]
 
         // Step 1: STFT → complex spectrogram [B, 2, freqBins, T]
@@ -83,6 +97,8 @@ public class MelRoFormer: Module {
         // Extract real and imaginary parts: each [B, 2, freqBins, T]
         let stftReal = stftComplex.realPart()
         let stftImag = stftComplex.imaginaryPart()
+        capture?("stft_R", stftReal)
+        capture?("stft_I", stftImag)
 
         // Step 3: CaC interleave — rearrange "b s f t -> b (f s) t"
         // Interleave stereo channels per frequency: [f0_L, f0_R, f1_L, f1_R, ...]
@@ -91,17 +107,21 @@ public class MelRoFormer: Module {
         let realInterleaved = stftReal.transposed(0, 2, 1, 3).reshaped([B, freqBins * 2, T])
         let imagInterleaved = stftImag.transposed(0, 2, 1, 3).reshaped([B, freqBins * 2, T])
 
-        // Stack real/imag as last dim: [B, freqBins*2, T, 2]
-        let stftRepr = stacked([realInterleaved, imagInterleaved], axis: -1)
+        // Stack real/imag as last dim: [B, freqBins*2, T, 2], then cast the CaC
+        // representation to the body precision. STFT above stayed fp32; the body
+        // (BandSplit → transformers → mask → complex-multiply) runs in bodyDType,
+        // and the masked result is cast back to fp32 (complex64) before iSTFT.
+        let stftRepr = stacked([realInterleaved, imagInterleaved], axis: -1).asType(bodyDType)
 
         // Step 4: BandSplit → [B, T, numBands, dim]
         var x = bandSplit.split(stftRepr)
+        capture?("bandsplit_x", x)
 
         // Step 5: 6× Dual-axis transformer
         let Nb = x.shape[2]
         let D = x.shape[3]
 
-        for pair in layers {
+        for (i, pair) in layers.enumerated() {
             let timeTransformer = pair[0]
             let freqTransformer = pair[1]
 
@@ -115,13 +135,16 @@ public class MelRoFormer: Module {
             let freqInput = x.reshaped([B * T, Nb, D])
             let freqOutput = freqTransformer(freqInput)
             x = freqOutput.reshaped([B, T, Nb, D])
+            capture?("layer\(i)_x", x)
         }
 
         // Step 6: Mask estimation → [B, T, totalBandDim]
         let masks = maskEstimators[0](x)
+        capture?("masks", masks)
 
         // Step 7: Merge masks back to full spectrum → [B, freqBins*2, T, 2]
         let fullMask = bandSplit.merge(bandMasks: masks, freqBinsTimesTwo: freqBins * 2)
+        capture?("full_mask", fullMask)
 
         // Step 8: Apply mask via complex multiplication
         // stftRepr: [B, freqBins*2, T, 2] (real/imag of input)
@@ -154,6 +177,7 @@ public class MelRoFormer: Module {
             window: window,
             length: originalLength
         )
+        capture?("out", separated)
 
         return separated
     }
